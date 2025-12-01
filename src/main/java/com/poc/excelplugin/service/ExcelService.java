@@ -9,6 +9,7 @@ import org.apache.poi.xssf.usermodel.XSSFDataValidationHelper;
 import org.apache.poi.xssf.usermodel.XSSFSheet;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.openxmlformats.schemas.officeDocument.x2006.customProperties.CTProperty;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import javax.crypto.Mac;
@@ -24,45 +25,40 @@ import java.util.*;
 @Service
 public class ExcelService {
 
-    // Ideally, store this in application.properties or Vault. NEVER expose this.
-    private static final String SECRET_KEY = "SUPER_SECRET_KEY_DO_NOT_SHARE";
-    private static final String HMAC_ALGO = "HmacSHA256";
+    // Injecting values from application.properties
+    @Value("${excel.security.secret}")
+    private String secretKey;
+
+    @Value("${excel.security.algorithm}")
+    private String hmacAlgo;
+
+    @Value("${excel.sheet.password}")
+    private String sheetPassword;
 
     public byte[] generateGenericExcel(ExcelRequest request) throws IOException {
-        log.info("--- Service: Starting Excel Generation ---");
-
         try (XSSFWorkbook workbook = new XSSFWorkbook()) {
             XSSFSheet sheet = workbook.createSheet("Data");
             DataFormat poiDataFormat = workbook.createDataFormat();
 
-            // 1. Generate a Unique ID for this specific file
-            String fileId = UUID.randomUUID().toString();
-            log.info("Generated File ID: {}", fileId);
-
+            // 1. Generate Headers & Data
             List<ExcelRequest.ColumnConfig> columns = request.getColumns();
             List<Map<String, Object>> dataList = request.getData();
 
-            // 2. Create Headers
             CellStyle headerStyle = createHeaderStyle(workbook);
             Row headerRow = sheet.createRow(0);
-            List<String> headerNames = new ArrayList<>();
-
             for (int i = 0; i < columns.size(); i++) {
-                String header = columns.get(i).getHeader();
-                headerNames.add(header);
-
                 Cell cell = headerRow.createCell(i);
-                cell.setCellValue(header);
+                cell.setCellValue(columns.get(i).getHeader());
                 cell.setCellStyle(headerStyle);
                 int width = (columns.get(i).getWidth() != null) ? columns.get(i).getWidth() : 5000;
                 sheet.setColumnWidth(i, width);
             }
 
-            // 3. SIGN THE FILE (HMAC of File ID + Headers)
-            // This binds the ID to the file structure.
-            signWorkbook(workbook, headerNames, fileId);
+            // 2. SIGN THE FILE
+            String fileId = UUID.randomUUID().toString();
+            signWorkbookWithSingleToken(workbook, fileId);
 
-            // 4. Pre-calculate Styles & Populate Data (Existing Logic)
+            // 3. Populate Data & Styles
             List<CellStyle> columnStyles = new ArrayList<>();
             for (ExcelRequest.ColumnConfig col : columns) {
                 CellStyle style = workbook.createCellStyle();
@@ -70,10 +66,6 @@ public class ExcelService {
                 if (col.isEditable()) {
                     style.setFillForegroundColor(IndexedColors.LEMON_CHIFFON.getIndex());
                     style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-                    style.setBorderBottom(BorderStyle.THIN);
-                    style.setBorderTop(BorderStyle.THIN);
-                    style.setBorderLeft(BorderStyle.THIN);
-                    style.setBorderRight(BorderStyle.THIN);
                 }
                 if (col.getDataFormat() != null && !col.getDataFormat().isEmpty()) {
                     style.setDataFormat(poiDataFormat.getFormat(col.getDataFormat()));
@@ -86,34 +78,20 @@ public class ExcelService {
                 for (Map<String, Object> rowData : dataList) {
                     Row row = sheet.createRow(rowIdx++);
                     for (int colIdx = 0; colIdx < columns.size(); colIdx++) {
-                        ExcelRequest.ColumnConfig colConfig = columns.get(colIdx);
-                        Object value = rowData.get(colConfig.getKey());
+                        Object value = rowData.get(columns.get(colIdx).getKey());
                         Cell cell = row.createCell(colIdx);
                         cell.setCellStyle(columnStyles.get(colIdx));
                         if (value instanceof Number) {
                             cell.setCellValue(((Number) value).doubleValue());
                         } else if (value != null) {
-                            if (colConfig.getDataFormat() != null && isNumeric(value.toString())) {
-                                try { cell.setCellValue(Double.parseDouble(value.toString())); }
-                                catch (NumberFormatException e) { cell.setCellValue(value.toString()); }
-                            } else {
-                                cell.setCellValue(value.toString());
-                            }
+                            cell.setCellValue(value.toString());
                         }
                     }
                 }
             }
 
-            // 5. Dropdowns
-            for (int colIdx = 0; colIdx < columns.size(); colIdx++) {
-                ExcelRequest.ColumnConfig col = columns.get(colIdx);
-                if (col.getDropdown() != null && !col.getDropdown().isEmpty()) {
-                    String[] options = col.getDropdown().toArray(new String[0]);
-                    addDropdownValidation(sheet, options, colIdx, 1, Math.max(100, rowIdx + 100));
-                }
-            }
-
-            sheet.protectSheet("password123");
+            // Protect with password from properties
+            sheet.protectSheet(sheetPassword);
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             workbook.write(out);
@@ -121,112 +99,64 @@ public class ExcelService {
         }
     }
 
-    /**
-     * Calculates HMAC Signature based on File ID + Headers.
-     */
-    private void signWorkbook(XSSFWorkbook workbook, List<String> headerNames, String fileId) {
+    private void signWorkbookWithSingleToken(XSSFWorkbook workbook, String fileId) {
         try {
-            // Data to sign: "UUID|ID|Car Name|City"
-            String dataToSign = fileId + "|" + String.join("|", headerNames);
-            String signature = calculateHMAC(dataToSign, SECRET_KEY);
+            String signature = calculateHMAC(fileId, secretKey);
+            String singleToken = fileId + "." + signature;
 
             POIXMLProperties props = workbook.getProperties();
             POIXMLProperties.CustomProperties customProps = props.getCustomProperties();
-
-            // Store ID and Signature
             if (customProps != null) {
-                customProps.addProperty("X-File-ID", fileId);
-                customProps.addProperty("X-Integrity-Sig", signature);
+                customProps.addProperty("Platform-Key", singleToken);
             }
-            log.info("Signed Workbook. ID={}, Signature={}", fileId, signature);
+            log.info("Generated Token: {}", singleToken);
 
         } catch (Exception e) {
-            log.error("Failed to sign workbook", e);
             throw new RuntimeException("Could not sign file");
         }
     }
 
-    /**
-     * VERIFICATION LOGIC: Returns the File ID if valid, throws Exception if invalid.
-     */
     public String verifyFileIntegrity(XSSFWorkbook workbook) {
         try {
             POIXMLProperties.CustomProperties props = workbook.getProperties().getCustomProperties();
 
-            // 1. Extract the Stored Signature
-            CTProperty sigProp = props.getProperty("X-Integrity-Sig");
-            if (sigProp == null) throw new SecurityException("No signature found.");
-            String storedSignature = sigProp.getLpwstr();
+            CTProperty tokenProp = props.getProperty("Platform-Key");
+            if (tokenProp == null) throw new SecurityException("No File Key found.");
 
-            // 2. Extract the File ID
-            CTProperty idProp = props.getProperty("X-File-ID");
-            if (idProp == null) throw new SecurityException("No File ID found.");
-            String fileId = idProp.getLpwstr();
+            String token = tokenProp.getLpwstr();
+            String[] parts = token.split("\\.");
+            if (parts.length != 2) throw new SecurityException("Invalid Key Format");
 
-            // 3. Extract Headers
-            XSSFSheet sheet = workbook.getSheetAt(0);
-            Row headerRow = sheet.getRow(0);
-            if (headerRow == null) throw new SecurityException("No headers found.");
-            List<String> extractedHeaders = new ArrayList<>();
-            for (Cell cell : headerRow) extractedHeaders.add(cell.getStringCellValue());
+            String fileId = parts[0];
+            String storedSig = parts[1];
 
-            // 4. Re-calculate HMAC
-            String dataToSign = fileId + "|" + String.join("|", extractedHeaders);
-            String calculatedSignature = calculateHMAC(dataToSign, SECRET_KEY);
+            String calculatedSig = calculateHMAC(fileId, secretKey);
 
-            log.info("Verifying ID: {}", fileId);
-
-            if (!calculatedSignature.equals(storedSignature)) {
-                log.warn("Signature Mismatch! File has been tampered with.");
+            if (!calculatedSig.equals(storedSig)) {
                 throw new SecurityException("Signature Mismatch");
             }
 
-            return fileId; // Return the ID if valid
+            return fileId;
 
         } catch (SecurityException se) {
             throw se;
         } catch (Exception e) {
-            log.error("Error verifying file", e);
             throw new RuntimeException("Error verifying file");
         }
     }
 
     private String calculateHMAC(String data, String key) throws NoSuchAlgorithmException, InvalidKeyException {
-        SecretKeySpec secretKeySpec = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), HMAC_ALGO);
-        Mac mac = Mac.getInstance(HMAC_ALGO);
+        SecretKeySpec secretKeySpec = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), hmacAlgo);
+        Mac mac = Mac.getInstance(hmacAlgo);
         mac.init(secretKeySpec);
-        byte[] rawHmac = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-        return Base64.getEncoder().encodeToString(rawHmac);
+        return Base64.getEncoder().encodeToString(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
     }
 
-    // --- Helpers (Styles, Dropdowns, etc.) remain same ---
     private CellStyle createHeaderStyle(Workbook workbook) {
         CellStyle style = workbook.createCellStyle();
-        style.setLocked(true);
         Font font = workbook.createFont();
         font.setBold(true);
         style.setFont(font);
-        style.setAlignment(HorizontalAlignment.CENTER);
-        style.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
-        style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
         return style;
-    }
-
-    private void addDropdownValidation(XSSFSheet sheet, String[] options, int colIndex, int firstRow, int lastRow) {
-        try {
-            XSSFDataValidationHelper dvHelper = new XSSFDataValidationHelper(sheet);
-            DataValidationConstraint constraint = dvHelper.createExplicitListConstraint(options);
-            CellRangeAddressList addressList = new CellRangeAddressList(firstRow, lastRow, colIndex, colIndex);
-            DataValidation validation = dvHelper.createValidation(constraint, addressList);
-            validation.setShowErrorBox(true);
-            sheet.addValidationData(validation);
-        } catch (Exception e) {
-            log.error("Error adding dropdown", e);
-        }
-    }
-
-    private boolean isNumeric(String str) {
-        if (str == null) return false;
-        try { Double.parseDouble(str); return true; } catch (NumberFormatException e) { return false; }
     }
 }
