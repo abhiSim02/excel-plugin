@@ -1,6 +1,8 @@
 package com.poc.excelplugin.service;
 
 import com.poc.excelplugin.dto.ExcelRequest;
+import lombok.AllArgsConstructor;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ooxml.POIXMLProperties;
 import org.apache.poi.ss.usermodel.*;
@@ -19,13 +21,14 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 @Slf4j
 @Service
 public class ExcelService {
 
-    // Injecting values from application.properties
     @Value("${excel.security.secret}")
     private String secretKey;
 
@@ -35,12 +38,37 @@ public class ExcelService {
     @Value("${excel.sheet.password}")
     private String sheetPassword;
 
-    public byte[] generateGenericExcel(ExcelRequest request) throws IOException {
+    private static final String DELIMITER = "|";
+    private static final String REGEX_DELIMITER = "\\|";
+
+    // --- Wrapper to return both File Bytes AND the Signature to the Controller ---
+    @Data
+    @AllArgsConstructor
+    public static class GenerationResult {
+        private byte[] fileContent;
+        private String signature; // The 24-char hash to save in DB
+    }
+
+    public GenerationResult generateGenericExcel(ExcelRequest request) throws IOException {
         try (XSSFWorkbook workbook = new XSSFWorkbook()) {
-            XSSFSheet sheet = workbook.createSheet("Data");
+
+            String rawEntity = (request.getEntityName() != null) ? request.getEntityName() : "Data";
+            String safeSheetName = rawEntity.replaceAll("[^a-zA-Z0-9 ]", "_");
+            if (safeSheetName.length() > 31) safeSheetName = safeSheetName.substring(0, 31);
+
+            XSSFSheet sheet = workbook.createSheet(safeSheetName);
             DataFormat poiDataFormat = workbook.createDataFormat();
 
-            // 1. Generate Headers & Data
+            // 1. Generate Metadata & Signature
+            String entity = request.getEntityName() != null ? request.getEntityName() : "unknown";
+            String user = request.getUserId() != null ? request.getUserId() : "unknown";
+            // Use readable timestamp
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS"));
+
+            // This helper calculates the signature, injects metadata, and RETURNS the signature
+            String generatedSignature = signWorkbookAndGetSignature(workbook, entity, user, timestamp);
+
+            // 2. Populate Columns & Data
             List<ExcelRequest.ColumnConfig> columns = request.getColumns();
             List<Map<String, Object>> dataList = request.getData();
 
@@ -54,11 +82,7 @@ public class ExcelService {
                 sheet.setColumnWidth(i, width);
             }
 
-            // 2. SIGN THE FILE
-            String fileId = UUID.randomUUID().toString();
-            signWorkbookWithSingleToken(workbook, fileId);
-
-            // 3. Populate Data & Styles
+            // Styles & Data Rows
             List<CellStyle> columnStyles = new ArrayList<>();
             for (ExcelRequest.ColumnConfig col : columns) {
                 CellStyle style = workbook.createCellStyle();
@@ -90,58 +114,77 @@ public class ExcelService {
                 }
             }
 
-            // Protect with password from properties
+            // Dropdowns
+            for (int colIdx = 0; colIdx < columns.size(); colIdx++) {
+                ExcelRequest.ColumnConfig col = columns.get(colIdx);
+                if (col.getDropdown() != null && !col.getDropdown().isEmpty()) {
+                    String[] options = col.getDropdown().toArray(new String[0]);
+                    addDropdownValidation(sheet, options, colIdx, 1, Math.max(100, rowIdx + 100));
+                }
+            }
+
             sheet.protectSheet(sheetPassword);
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             workbook.write(out);
-            return out.toByteArray();
+
+            // Return BOTH content (for file) and signature (for DB)
+            return new GenerationResult(out.toByteArray(), generatedSignature);
         }
     }
 
-    private void signWorkbookWithSingleToken(XSSFWorkbook workbook, String fileId) {
+    private String signWorkbookAndGetSignature(XSSFWorkbook workbook, String entity, String user, String timestamp) {
         try {
-            String signature = calculateHMAC(fileId, secretKey);
-            String singleToken = fileId + "." + signature;
+            // Data to sign: "Entity|User|Timestamp"
+            String dataPayload = entity + DELIMITER + user + DELIMITER + timestamp;
+            String fullSignature = calculateHMAC(dataPayload, secretKey);
+
+            // Truncate to 24 chars
+            String signature24 = fullSignature.length() > 24 ? fullSignature.substring(0, 24) : fullSignature;
+
+            // Combine: "Entity|User|Timestamp|Signature"
+            String platformKey = dataPayload + DELIMITER + signature24;
 
             POIXMLProperties props = workbook.getProperties();
             POIXMLProperties.CustomProperties customProps = props.getCustomProperties();
             if (customProps != null) {
-                customProps.addProperty("Platform-Key", singleToken);
+                customProps.addProperty("platform_key", platformKey);
             }
-            log.info("Generated Token: {}", singleToken);
+            log.info("Generated Platform Key: {}", platformKey);
+
+            return signature24; // Return only the hash to be stored in DB
 
         } catch (Exception e) {
-            throw new RuntimeException("Could not sign file");
+            throw new RuntimeException("Could not sign file", e);
         }
     }
 
-    public String verifyFileIntegrity(XSSFWorkbook workbook) {
+    /**
+     * Extracts the full key from the file for the Controller to process.
+     */
+    public String extractPlatformKey(XSSFWorkbook workbook) {
         try {
             POIXMLProperties.CustomProperties props = workbook.getProperties().getCustomProperties();
-
-            CTProperty tokenProp = props.getProperty("Platform-Key");
-            if (tokenProp == null) throw new SecurityException("No File Key found.");
-
-            String token = tokenProp.getLpwstr();
-            String[] parts = token.split("\\.");
-            if (parts.length != 2) throw new SecurityException("Invalid Key Format");
-
-            String fileId = parts[0];
-            String storedSig = parts[1];
-
-            String calculatedSig = calculateHMAC(fileId, secretKey);
-
-            if (!calculatedSig.equals(storedSig)) {
-                throw new SecurityException("Signature Mismatch");
-            }
-
-            return fileId;
-
-        } catch (SecurityException se) {
-            throw se;
+            CTProperty tokenProp = props.getProperty("platform_key");
+            if (tokenProp == null) throw new SecurityException("Missing Hash Key (platform_key)");
+            return tokenProp.getLpwstr();
         } catch (Exception e) {
-            throw new RuntimeException("Error verifying file");
+            throw new SecurityException("Could not read platform key: " + e.getMessage());
+        }
+    }
+
+    // Double check the math (Internal Integrity check)
+    public void verifyMathIntegrity(String entity, String user, String timestamp, String storedSig) {
+        try {
+            String dataPayload = entity + DELIMITER + user + DELIMITER + timestamp;
+            String fullSignature = calculateHMAC(dataPayload, secretKey);
+            String calculatedSig24 = fullSignature.length() > 24 ? fullSignature.substring(0, 24) : fullSignature;
+
+            if (!calculatedSig24.equals(storedSig)) {
+                throw new SecurityException("Signature Mismatch - Metadata modified");
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Math verification failed", e);
         }
     }
 
@@ -157,6 +200,22 @@ public class ExcelService {
         Font font = workbook.createFont();
         font.setBold(true);
         style.setFont(font);
+        style.setAlignment(HorizontalAlignment.CENTER);
+        style.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+        style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
         return style;
+    }
+
+    private void addDropdownValidation(XSSFSheet sheet, String[] options, int colIndex, int firstRow, int lastRow) {
+        try {
+            XSSFDataValidationHelper dvHelper = new XSSFDataValidationHelper(sheet);
+            DataValidationConstraint constraint = dvHelper.createExplicitListConstraint(options);
+            CellRangeAddressList addressList = new CellRangeAddressList(firstRow, lastRow, colIndex, colIndex);
+            DataValidation validation = dvHelper.createValidation(constraint, addressList);
+            validation.setShowErrorBox(true);
+            sheet.addValidationData(validation);
+        } catch (Exception e) {
+            log.error("Error adding dropdown", e);
+        }
     }
 }

@@ -10,7 +10,9 @@ import java.util.Map;
 @AllArgsConstructor
 @NoArgsConstructor
 public class ExcelRequest {
-    private String contextName;
+    private String entityName;
+    private String userId;
+
     private List<ColumnConfig> columns;
     private List<Map<String, Object>> data;
 
