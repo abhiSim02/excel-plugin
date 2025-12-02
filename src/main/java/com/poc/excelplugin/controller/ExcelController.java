@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Optional;
 
 @Slf4j
 @RestController
@@ -43,13 +44,26 @@ public class ExcelController {
             ExcelService.GenerationResult result = excelService.generateGenericExcel(request);
             String signature = result.getSignature();
 
-            // 2. SAVE TO DB: Store [User ID] + [Hash Key]
-            UserFileHash dbEntry = new UserFileHash();
-            dbEntry.setUserId(user);
-            dbEntry.setHashKey(signature);
-            userHashRepository.save(dbEntry);
+            // 2. DB LOGIC: Check if record exists for this User + Entity
+            Optional<UserFileHash> existingRecord = userHashRepository.findByUserIdAndEntityName(user, entity);
 
-            log.info("DB SAVED: User [{}] -> Hash [{}]", user, signature);
+            UserFileHash dbEntry;
+            if (existingRecord.isPresent()) {
+                // UPDATE Existing
+                dbEntry = existingRecord.get();
+                dbEntry.setHashKey(signature); // Overwrite old hash
+                log.info("DB UPDATE: Found existing record for User [{}] Entity [{}]. Updating Hash.", user, entity);
+            } else {
+                // CREATE New
+                dbEntry = new UserFileHash();
+                dbEntry.setUserId(user);
+                dbEntry.setEntityName(entity);
+                dbEntry.setHashKey(signature);
+                log.info("DB INSERT: Creating new record for User [{}] Entity [{}].", user, entity);
+            }
+
+            // Save (Timestamps handled automatically by @PrePersist/@PreUpdate)
+            userHashRepository.save(dbEntry);
 
             // 3. Save File to Disk
             String filename = entity + ".xlsx";
@@ -59,7 +73,7 @@ public class ExcelController {
             }
             Files.write(path, result.getFileContent());
 
-            return ResponseEntity.ok("SUCCESS: File created & Hash stored in DB.");
+            return ResponseEntity.ok("SUCCESS: File created. Database updated for Entity: " + entity);
 
         } catch (IOException e) {
             log.error(">>> ERROR: IO Exception.", e);
@@ -78,8 +92,6 @@ public class ExcelController {
 
         try (XSSFWorkbook workbook = new XSSFWorkbook(file.getInputStream())) {
 
-            // 1. Extract the full metadata string from the file
-            // Format: Entity|User|Time|Signature
             String fullToken = excelService.extractPlatformKey(workbook);
             String[] parts = fullToken.split("\\|");
 
@@ -87,20 +99,20 @@ public class ExcelController {
                 return ResponseEntity.status(400).body("❌ INVALID FORMAT: Token missing components.");
             }
 
-            String fileUser = parts[1];      // User ID from file metadata
-            String fileSignature = parts[3]; // The 24-char Hash
+            String fileEntity = parts[0];
+            String fileUser = parts[1];
+            String fileSignature = parts[3];
 
-            // 2. DB VERIFICATION: Check if this Hash exists for this User in Postgres
+            // DB VERIFICATION
+            // We verify if this specific Hash exists.
+            // Note: If the user generated a NEW file for this entity, the old hash is gone from DB,
+            // so the old file will correctly fail verification.
             boolean isValid = userHashRepository.existsByUserIdAndHashKey(fileUser, fileSignature);
 
             if (isValid) {
-                // Optional: Verify Math (to ensure metadata wasn't tampered to match DB hash)
-                excelService.verifyMathIntegrity(parts[0], parts[1], parts[2], parts[3]);
-
-                return ResponseEntity.ok("✅ VALIDATED VIA DB.\nDatabase confirms this signature belongs to user: " + fileUser);
+                return ResponseEntity.ok("✅ VALIDATED VIA DB.\nDatabase confirms this is the latest valid file for User: " + fileUser);
             } else {
-                log.warn("DB Lookup Failed. User: {}, Signature: {}", fileUser, fileSignature);
-                return ResponseEntity.status(401).body("❌ UNAUTHORIZED: This file's signature was not found in the Database.");
+                return ResponseEntity.status(401).body("❌ UNAUTHORIZED: Hash not found. (User may have generated a newer version of this file).");
             }
 
         } catch (SecurityException e) {
