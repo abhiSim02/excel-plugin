@@ -12,6 +12,7 @@ import java.util.Map;
 public class ExcelRequest {
     private String entityName;
     private String userId;
+    private String timezone = "UTC"; // Default to UTC
 
     private List<ColumnConfig> columns;
     private List<Map<String, Object>> data;
@@ -25,6 +26,6 @@ public class ExcelRequest {
         private boolean editable;
         private List<String> dropdown;
         private Integer width;
-        private String dataFormat;
+        private String dataFormat; // e.g. "0.00" or "yyyy-mm-dd"
     }
 }

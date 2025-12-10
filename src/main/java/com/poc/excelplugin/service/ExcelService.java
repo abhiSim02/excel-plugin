@@ -4,26 +4,29 @@ import com.poc.excelplugin.dto.ExcelRequest;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.poi.ss.SpreadsheetVersion;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.ss.util.CellRangeAddressList;
 import org.apache.poi.ss.util.CellReference;
-import org.apache.poi.xssf.usermodel.XSSFDataValidationHelper;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.apache.poi.xssf.usermodel.XSSFSheet;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
+
+import org.apache.poi.ss.usermodel.Name;
+import org.apache.poi.ss.util.AreaReference;
 
 @Slf4j
 @Service
@@ -32,16 +35,13 @@ public class ExcelService {
     @Value("${excel.security.secret}")
     private String secretKey;
 
-    @Value("${excel.security.algorithm}")
-    private String hmacAlgo;
-
     @Value("${excel.sheet.password}")
     private String sheetPassword;
 
-    private static final String DELIMITER = "|";
-    // Sheets
     private static final String HIDDEN_SHEET_METADATA = "metadata_protected";
     private static final String HIDDEN_SHEET_LOOKUP = "lookup_data";
+    private static final String HIDDEN_SHEET_SHADOW = "shadow_data";
+    private static final int MAX_ROWS = SpreadsheetVersion.EXCEL2007.getLastRowIndex();
 
     @Data
     @AllArgsConstructor
@@ -50,218 +50,371 @@ public class ExcelService {
         private String signature;
     }
 
-    public GenerationResult generateGenericExcel(ExcelRequest request) throws IOException {
-        try (XSSFWorkbook workbook = new XSSFWorkbook()) {
+    public GenerationResult generateLargeExcel(ExcelRequest request, String timestamp) throws IOException {
+        // SXSSF Window: Keeps 100 rows in RAM, flushes rest to disk.
+        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
+            workbook.setCompressTempFiles(true);
 
-            // 1. Create Main Data Sheet
-            String rawEntity = (request.getEntityName() != null) ? request.getEntityName() : "Data";
-            String safeSheetName = rawEntity.replaceAll("[^a-zA-Z0-9 ]", "_");
-            if (safeSheetName.length() > 31) safeSheetName = safeSheetName.substring(0, 31);
+            // 1. Create Sheets
+            SXSSFSheet mainSheet = workbook.createSheet(sanitizeSheetName(request.getEntityName()));
+            SXSSFSheet shadowSheet = workbook.createSheet(HIDDEN_SHEET_SHADOW);
+            SXSSFSheet lookupSheet = workbook.createSheet(HIDDEN_SHEET_LOOKUP);
 
-            XSSFSheet mainSheet = workbook.createSheet(safeSheetName);
-            DataFormat poiDataFormat = workbook.createDataFormat();
+            mainSheet.trackAllColumnsForAutoSizing();
 
-            // 2. Security: Sign File
-            String entity = request.getEntityName() != null ? request.getEntityName() : "unknown";
-            String user = request.getUserId() != null ? request.getUserId() : "unknown";
-            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS"));
-            String generatedSignature = signWorkbookWithHiddenSheet(workbook, entity, user, timestamp);
+            // 2. Setup Styles & Headers
+            Map<String, CellStyle> styles = createStyles(workbook);
+            createHeaderRow(mainSheet, request.getColumns(), styles.get("header"));
+            createHeaderRow(shadowSheet, request.getColumns(), styles.get("header"));
 
-            // 3. Prepare Lookup Sheet for Dropdowns
-            XSSFSheet lookupSheet = workbook.createSheet(HIDDEN_SHEET_LOOKUP);
+            // 3. Configure Logic
+            configureSheetLogic(mainSheet, workbook, request.getColumns(), lookupSheet);
 
-            // 4. Headers
-            List<ExcelRequest.ColumnConfig> columns = request.getColumns();
-            CellStyle headerStyle = createHeaderStyle(workbook);
-            Row headerRow = mainSheet.createRow(0);
-            for (int i = 0; i < columns.size(); i++) {
-                Cell cell = headerRow.createCell(i);
-                cell.setCellValue(columns.get(i).getHeader());
-                cell.setCellStyle(headerStyle);
-                int width = (columns.get(i).getWidth() != null) ? columns.get(i).getWidth() : 5000;
-                mainSheet.setColumnWidth(i, width);
-            }
+            // 4. Stream Data & Calculate Content Hash
+            StringBuilder contentHashBuilder = new StringBuilder();
 
-            // 5. Styles & Configs
-            List<CellStyle> columnStyles = new ArrayList<>();
-            int lookupColIdx = 0; // Track column index in the hidden lookup sheet
+            if (request.getData() != null) {
+                int rowIdx = 1;
+                for (Map<String, Object> rowData : request.getData()) {
+                    Row mainRow = mainSheet.createRow(rowIdx);
+                    Row shadowRow = shadowSheet.createRow(rowIdx);
 
-            for (int i = 0; i < columns.size(); i++) {
-                ExcelRequest.ColumnConfig colConfig = columns.get(i);
+                    for (int colIdx = 0; colIdx < request.getColumns().size(); colIdx++) {
+                        ExcelRequest.ColumnConfig col = request.getColumns().get(colIdx);
+                        Object value = rowData.get(col.getKey());
 
-                // Style Setup
-                CellStyle style = workbook.createCellStyle();
-                style.setLocked(!colConfig.isEditable());
-                if (colConfig.isEditable()) {
-                    style.setFillForegroundColor(IndexedColors.LEMON_CHIFFON.getIndex());
-                    style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-                }
-                if (colConfig.getDataFormat() != null && !colConfig.getDataFormat().isEmpty()) {
-                    style.setDataFormat(poiDataFormat.getFormat(colConfig.getDataFormat()));
-                }
-                columnStyles.add(style);
+                        // A. Write to Visible Main Sheet
+                        Cell mainCell = mainRow.createCell(colIdx);
+                        setCellValue(mainCell, value);
+                        mainCell.setCellStyle(col.isEditable() ? styles.get("editable") : styles.get("locked"));
 
-                // --- ROBUST DROPDOWN & RED HIGHLIGHT LOGIC ---
-                if (colConfig.getDropdown() != null && !colConfig.getDropdown().isEmpty()) {
-                    // A. Write Options to Hidden Sheet
-                    String namedRangeName = "List_" + colConfig.getKey();
-                    // Clean name (Named ranges can't have spaces)
-                    namedRangeName = namedRangeName.replaceAll("[^a-zA-Z0-9_]", "_");
+                        // B. Write to Hidden Shadow Sheet
+                        Cell shadowCell = shadowRow.createCell(colIdx);
+                        setCellValue(shadowCell, value);
 
-                    writeLookupData(lookupSheet, colConfig.getDropdown(), lookupColIdx);
-
-                    // B. Create Named Range (e.g., "List_Region")
-                    createNamedRange(workbook, HIDDEN_SHEET_LOOKUP, namedRangeName, lookupColIdx, colConfig.getDropdown().size());
-
-                    // C. Apply Data Validation (Using Name)
-                    applyDataValidation(mainSheet, namedRangeName, i);
-
-                    // D. Apply Conditional Formatting (Red if invalid)
-                    applyErrorHighlighting(mainSheet, i, namedRangeName);
-
-                    lookupColIdx++;
+                        // C. Hashing Logic (Read-Only Columns only)
+                        if (!col.isEditable() && value != null) {
+                            contentHashBuilder.append(value.toString().trim());
+                        }
+                    }
+                    rowIdx++;
+                    if (rowIdx >= MAX_ROWS) break;
                 }
             }
 
-            // 6. Populate Data
-            List<Map<String, Object>> dataList = request.getData();
-            int rowIdx = 1;
-            if (dataList != null) {
-                for (Map<String, Object> rowData : dataList) {
-                    Row row = mainSheet.createRow(rowIdx++);
-                    for (int colIdx = 0; colIdx < columns.size(); colIdx++) {
-                        Object value = rowData.get(columns.get(colIdx).getKey());
-                        Cell cell = row.createCell(colIdx);
-                        cell.setCellStyle(columnStyles.get(colIdx));
+            // 5. Finalize Hash & Sign
+            String dataHash = DigestUtils.sha256Hex(contentHashBuilder.toString());
+            String signature = signWorkbook(workbook, request.getEntityName(), request.getUserId(), timestamp, dataHash);
 
-                        if (value instanceof Number) {
-                            cell.setCellValue(((Number) value).doubleValue());
-                        } else if (value != null) {
-                            cell.setCellValue(value.toString());
+            // 6. Hide Sheets & Protect
+            workbook.setSheetVisibility(workbook.getSheetIndex(lookupSheet), SheetVisibility.VERY_HIDDEN);
+            workbook.setSheetVisibility(workbook.getSheetIndex(shadowSheet), SheetVisibility.VERY_HIDDEN);
+            mainSheet.protectSheet(sheetPassword);
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            workbook.write(out);
+            workbook.dispose();
+
+            return new GenerationResult(out.toByteArray(), signature);
+        }
+    }
+
+    private void configureSheetLogic(SXSSFSheet sheet, SXSSFWorkbook workbook, List<ExcelRequest.ColumnConfig> columns, Sheet lookupSheet) {
+        XSSFSheet xssfSheet = workbook.getXSSFWorkbook().getSheet(sheet.getSheetName());
+        SheetConditionalFormatting sheetCF = xssfSheet.getSheetConditionalFormatting();
+
+        int lookupColIdx = 0;
+
+        for (int i = 0; i < columns.size(); i++) {
+            ExcelRequest.ColumnConfig col = columns.get(i);
+            String colLetter = CellReference.convertNumToColString(i);
+            CellRangeAddress[] fullColumnRegion = { new CellRangeAddress(1, MAX_ROWS - 1, i, i) };
+
+            // --- 1. RED Logic (Validation Error) ---
+            if (col.getDropdown() != null && !col.getDropdown().isEmpty()) {
+                writeLookupData(lookupSheet, col.getDropdown(), lookupColIdx);
+
+                String rangeName = "List_" + col.getKey().replaceAll("[^a-zA-Z0-9_]", "_");
+                Name namedRange = workbook.createName();
+                namedRange.setNameName(rangeName);
+                String lookupColLetter = CellReference.convertNumToColString(lookupColIdx);
+                namedRange.setRefersToFormula(HIDDEN_SHEET_LOOKUP + "!$" + lookupColLetter + "$1:$" + lookupColLetter + "$" + col.getDropdown().size());
+
+                DataValidationHelper dvHelper = sheet.getDataValidationHelper();
+                DataValidationConstraint constraint = dvHelper.createFormulaListConstraint(rangeName);
+                DataValidation validation = dvHelper.createValidation(constraint, new CellRangeAddressList(1, MAX_ROWS - 1, i, i));
+                validation.setShowErrorBox(true);
+                sheet.addValidationData(validation);
+
+                String redFormula = String.format("AND(%s2<>\"\", COUNTIF(%s, %s2)=0)", colLetter, rangeName, colLetter);
+                ConditionalFormattingRule redRule = sheetCF.createConditionalFormattingRule(redFormula);
+                PatternFormatting redFill = redRule.createPatternFormatting();
+                redFill.setFillBackgroundColor(IndexedColors.RED.getIndex());
+                redFill.setFillPattern(PatternFormatting.SOLID_FOREGROUND);
+                FontFormatting whiteFont = redRule.createFontFormatting();
+                whiteFont.setFontColorIndex(IndexedColors.WHITE.getIndex());
+
+                sheetCF.addConditionalFormatting(fullColumnRegion, redRule);
+                lookupColIdx++;
+            }
+
+            // --- 2. ORANGE Logic (Modified) ---
+            if (col.isEditable()) {
+                String orangeFormula = String.format("%s2<>%s!%s2", colLetter, HIDDEN_SHEET_SHADOW, colLetter);
+                ConditionalFormattingRule orangeRule = sheetCF.createConditionalFormattingRule(orangeFormula);
+                PatternFormatting orangeFill = orangeRule.createPatternFormatting();
+                orangeFill.setFillBackgroundColor(IndexedColors.ORANGE.getIndex());
+                orangeFill.setFillPattern(PatternFormatting.SOLID_FOREGROUND);
+
+                sheetCF.addConditionalFormatting(fullColumnRegion, orangeRule);
+            }
+        }
+    }
+
+    private String signWorkbook(Workbook workbook, String entity, String user, String timestamp, String dataHash) {
+        try {
+            String payload = entity + "|" + user + "|" + timestamp + "|" + dataHash;
+            Mac mac = Mac.getInstance("HmacSHA256");
+            SecretKeySpec secretKeySpec = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+            mac.init(secretKeySpec);
+
+            String fullSignature = Base64.getEncoder().encodeToString(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
+
+            // --- MODIFIED: TRUNCATE TO 24 CHARS ---
+            String signature = fullSignature.length() > 24 ? fullSignature.substring(0, 24) : fullSignature;
+
+            // Store in Hidden Metadata Sheet
+            String storedValue = signature + "::" + dataHash + "::" + entity + "::" + user + "::" + timestamp;
+            Sheet metaSheet = workbook.createSheet(HIDDEN_SHEET_METADATA);
+            metaSheet.createRow(0).createCell(0).setCellValue(Base64.getEncoder().encodeToString(storedValue.getBytes(StandardCharsets.UTF_8)));
+
+            workbook.setSheetVisibility(workbook.getSheetIndex(metaSheet), SheetVisibility.VERY_HIDDEN);
+            return signature;
+        } catch (Exception e) {
+            throw new RuntimeException("Signing failed", e);
+        }
+    }
+
+    private void writeLookupData(Sheet lookupSheet, List<String> options, int colIdx) {
+        for (int i = 0; i < options.size(); i++) {
+            Row row = lookupSheet.getRow(i);
+            if (row == null) row = lookupSheet.createRow(i);
+            row.createCell(colIdx).setCellValue(options.get(i));
+        }
+    }
+
+    private void createHeaderRow(Sheet sheet, List<ExcelRequest.ColumnConfig> columns, CellStyle style) {
+        Row row = sheet.createRow(0);
+        for (int i = 0; i < columns.size(); i++) {
+            Cell cell = row.createCell(i);
+            cell.setCellValue(columns.get(i).getHeader());
+            cell.setCellStyle(style);
+            sheet.setColumnWidth(i, columns.get(i).getWidth() != null ? columns.get(i).getWidth() : 4000);
+        }
+    }
+
+    private void setCellValue(Cell cell, Object value) {
+        if (value instanceof Number) cell.setCellValue(((Number) value).doubleValue());
+        else if (value != null) cell.setCellValue(value.toString());
+    }
+
+    private Map<String, CellStyle> createStyles(Workbook wb) {
+        Map<String, CellStyle> styles = new HashMap<>();
+
+        CellStyle header = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        header.setFont(headerFont);
+        header.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+        header.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        styles.put("header", header);
+
+        CellStyle editable = wb.createCellStyle();
+        editable.setLocked(false);
+        editable.setFillForegroundColor(IndexedColors.LEMON_CHIFFON.getIndex());
+        editable.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        styles.put("editable", editable);
+
+        CellStyle locked = wb.createCellStyle();
+        locked.setLocked(true);
+        styles.put("locked", locked);
+
+        return styles;
+    }
+
+    private String sanitizeSheetName(String name) {
+        return name == null ? "Data" : name.replaceAll("[^a-zA-Z0-9 ]", "_");
+    }
+
+    public Map<String, Object> analyzeChanges(MultipartFile file) throws IOException {
+        try (XSSFWorkbook workbook = new XSSFWorkbook(file.getInputStream())) {
+
+            Sheet mainSheet = workbook.getSheetAt(0);
+            Sheet shadowSheet = workbook.getSheet("shadow_data");
+
+            if (shadowSheet == null) {
+                throw new IllegalArgumentException("Invalid File: Missing shadow_data for audit.");
+            }
+
+            // 1. Pre-load Validation Rules
+            Map<Integer, Set<String>> validationRules = extractValidationRules(workbook, mainSheet);
+
+            int totalChangedCells = 0;
+            int totalInvalidCells = 0;
+
+            // Track unique row indices for different stats
+            Set<Integer> rowsWithChanges = new HashSet<>();
+            Set<Integer> rowsWithErrors = new HashSet<>();
+
+            List<Map<String, Object>> rowDetails = new ArrayList<>();
+
+            // 2. Iterate Rows
+            for (int i = 1; i <= mainSheet.getLastRowNum(); i++) {
+                Row mainRow = mainSheet.getRow(i);
+                Row shadowRow = shadowSheet.getRow(i);
+
+                if (mainRow == null) continue;
+
+                boolean rowChanged = false;
+                boolean rowInvalid = false;
+
+                Map<String, Object> details = new LinkedHashMap<>();
+                details.put("rowIndex", i + 1);
+
+                // 3. Iterate Columns
+                for (int j = 0; j < mainRow.getLastCellNum(); j++) {
+                    String original = getCellValueAsString(shadowRow.getCell(j));
+                    String current = getCellValueAsString(mainRow.getCell(j));
+
+                    // A. CHANGE DETECTION
+                    if (!Objects.equals(original, current)) {
+                        details.put("col_" + j + "_change", "Changed from [" + original + "] to [" + current + "]");
+                        totalChangedCells++;
+                        rowChanged = true;
+                    }
+
+                    // B. VALIDATION CHECK
+                    if (validationRules.containsKey(j)) {
+                        Set<String> allowedValues = validationRules.get(j);
+                        if (!current.isEmpty() && !allowedValues.contains(current)) {
+                            details.put("col_" + j + "_error", "Invalid Value: [" + current + "]");
+                            totalInvalidCells++;
+                            rowInvalid = true;
+                        }
+                    }
+                }
+
+                if (rowChanged) rowsWithChanges.add(i);
+                if (rowInvalid) rowsWithErrors.add(i);
+
+                // Report if EITHER changed OR invalid
+                if (rowChanged || rowInvalid) {
+                    // Add status flag for UI convenience
+                    details.put("status", rowInvalid ? "INVALID" : "MODIFIED_VALID");
+                    rowDetails.add(details);
+                }
+            }
+
+            // 4. Construct Precise Stats
+            int totalRows = mainSheet.getLastRowNum();
+
+            Map<String, Object> stats = new LinkedHashMap<>();
+            stats.put("totalRowsProcessed", totalRows);
+
+            // Purely valid data (Total - Invalid)
+            stats.put("totalValidRows", totalRows - rowsWithErrors.size());
+
+            // The number you are looking for (3)
+            stats.put("totalRowsWithErrors", rowsWithErrors.size());
+
+            // The number of touched rows (6)
+            stats.put("totalRowsModified", rowsWithChanges.size());
+
+            stats.put("totalChangedCells", totalChangedCells);
+            stats.put("totalInvalidCells", totalInvalidCells);
+
+            if (totalRows > 0) {
+                stats.put("errorRate", String.format("%.2f%%", (double) rowsWithErrors.size() / totalRows * 100));
+            } else {
+                stats.put("errorRate", "0.00%");
+            }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("statistics", stats);
+            result.put("details", rowDetails);
+
+            return result;
+        }
+    }
+    /**
+     * Extracts dropdown options from the file by resolving Named Ranges.
+     */
+    private Map<Integer, Set<String>> extractValidationRules(Workbook workbook, Sheet mainSheet) {
+        Map<Integer, Set<String>> rules = new HashMap<>();
+
+        // Get all data validations from the main sheet
+        List<? extends DataValidation> validations = mainSheet.getDataValidations();
+
+        for (DataValidation dv : validations) {
+            // Get the Named Range name (e.g., "List_Region")
+            String formula = dv.getValidationConstraint().getFormula1();
+
+            if (formula != null && !formula.isEmpty()) {
+                // Resolve Name to Range (e.g., lookup_data!$A$1:$A$5)
+                Name namedRange = workbook.getName(formula);
+                if (namedRange != null) {
+                    Set<String> allowedValues = getValuesFromNamedRange(workbook, namedRange);
+
+                    // Map this rule to the columns it applies to
+                    CellRangeAddress[] regions = dv.getRegions().getCellRangeAddresses();
+                    for (CellRangeAddress region : regions) {
+                        for (int col = region.getFirstColumn(); col <= region.getLastColumn(); col++) {
+                            rules.put(col, allowedValues);
                         }
                     }
                 }
             }
-
-            // 7. Finalize (Hide Sheets & Protect)
-            workbook.setSheetVisibility(workbook.getSheetIndex(lookupSheet), SheetVisibility.VERY_HIDDEN);
-            mainSheet.protectSheet(sheetPassword);
-            workbook.setActiveSheet(workbook.getSheetIndex(mainSheet));
-
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            workbook.write(out);
-
-            return new GenerationResult(out.toByteArray(), generatedSignature);
         }
+        return rules;
     }
 
-    // --- NEW: Write Dropdown Data to Hidden Sheet ---
-    private void writeLookupData(XSSFSheet lookupSheet, List<String> options, int colIdx) {
-        for (int i = 0; i < options.size(); i++) {
-            Row row = lookupSheet.getRow(i);
-            if (row == null) row = lookupSheet.createRow(i);
-            Cell cell = row.createCell(colIdx);
-            cell.setCellValue(options.get(i));
-        }
-    }
-
-    // --- NEW: Create Excel Named Range ---
-    private void createNamedRange(Workbook workbook, String sheetName, String rangeName, int colIdx, int rowCount) {
-        Name namedRange = workbook.createName();
-        namedRange.setNameName(rangeName);
-        String colLetter = CellReference.convertNumToColString(colIdx);
-        // Formula: lookup_data!$A$1:$A$5
-        String reference = sheetName + "!$" + colLetter + "$1:$" + colLetter + "$" + rowCount;
-        namedRange.setRefersToFormula(reference);
-    }
-
-    // --- NEW: Apply Data Validation using Named Range ---
-    private void applyDataValidation(XSSFSheet sheet, String namedRangeName, int colIdx) {
-        XSSFDataValidationHelper dvHelper = new XSSFDataValidationHelper(sheet);
-        // Constraint: =List_Region
-        DataValidationConstraint constraint = dvHelper.createFormulaListConstraint(namedRangeName);
-        // Apply to rows 1 to 5000
-        CellRangeAddressList addressList = new CellRangeAddressList(1, 5000, colIdx, colIdx);
-        DataValidation validation = dvHelper.createValidation(constraint, addressList);
-        validation.setShowErrorBox(true);
-        validation.setErrorStyle(DataValidation.ErrorStyle.STOP);
-        validation.createErrorBox("Invalid Input", "Please select a valid value from the dropdown list.");
-        sheet.addValidationData(validation);
-    }
-
-    // --- NEW: Apply RED Background if Value NOT in List ---
-    private void applyErrorHighlighting(XSSFSheet sheet, int colIdx, String namedRangeName) {
-        SheetConditionalFormatting sheetCF = sheet.getSheetConditionalFormatting();
-
-        // Formula: =AND(A2<>"", COUNTIF(List_Region, A2)=0)
-        // If cell is not empty AND count in list is 0 -> Error
-        String colLetter = CellReference.convertNumToColString(colIdx);
-        String ruleFormula = String.format("AND(%s2<>\"\", COUNTIF(%s, %s2)=0)", colLetter, namedRangeName, colLetter);
-
-        ConditionalFormattingRule rule = sheetCF.createConditionalFormattingRule(ruleFormula);
-        PatternFormatting fill = rule.createPatternFormatting();
-        fill.setFillBackgroundColor(IndexedColors.RED.getIndex());
-        fill.setFillPattern(PatternFormatting.SOLID_FOREGROUND);
-
-        // Font Color White (Optional, for readability on Red)
-        FontFormatting font = rule.createFontFormatting();
-        font.setFontColorIndex(IndexedColors.WHITE.getIndex());
-
-        // Apply to range (Row 2 to 5000)
-        CellRangeAddress[] regions = {
-                new CellRangeAddress(1, 5000, colIdx, colIdx)
-        };
-        sheetCF.addConditionalFormatting(regions, rule);
-    }
-
-    // --- Existing Security Logic (Unchanged) ---
-    private String signWorkbookWithHiddenSheet(XSSFWorkbook workbook, String entity, String user, String timestamp) {
+    private Set<String> getValuesFromNamedRange(Workbook workbook, Name namedRange) {
+        Set<String> values = new HashSet<>();
         try {
-            String dataPayload = entity + DELIMITER + user + DELIMITER + timestamp;
-            String fullSignature = calculateHMAC(dataPayload, secretKey);
-            String signature24 = fullSignature.length() > 24 ? fullSignature.substring(0, 24) : fullSignature;
-            String platformKey = dataPayload + DELIMITER + signature24;
-            String encodedKey = Base64.getEncoder().encodeToString(platformKey.getBytes(StandardCharsets.UTF_8));
+            // Get the reference (e.g., lookup_data!$A$1:$A$5)
+            String reference = namedRange.getRefersToFormula();
+            AreaReference area = new AreaReference(reference, SpreadsheetVersion.EXCEL2007);
 
-            XSSFSheet metaSheet = workbook.createSheet(HIDDEN_SHEET_METADATA);
-            Row row = metaSheet.createRow(0);
-            Cell cell = row.createCell(0);
-            cell.setCellValue(encodedKey);
-            metaSheet.protectSheet(sheetPassword);
-            workbook.setSheetVisibility(workbook.getSheetIndex(metaSheet), SheetVisibility.VERY_HIDDEN);
+            // Parse Sheet Name and Cells
+            CellReference[] cells = area.getAllReferencedCells();
+            if (cells.length > 0) {
+                String sheetName = cells[0].getSheetName();
+                Sheet lookupSheet = workbook.getSheet(sheetName);
 
-            return signature24;
+                for (CellReference cellRef : cells) {
+                    Row row = lookupSheet.getRow(cellRef.getRow());
+                    if (row != null) {
+                        Cell cell = row.getCell(cellRef.getCol());
+                        String val = getCellValueAsString(cell);
+                        if (!val.isEmpty()) {
+                            values.add(val); // Strings are case-sensitive usually
+                        }
+                    }
+                }
+            }
         } catch (Exception e) {
-            throw new RuntimeException("Could not sign file", e);
+            log.warn("Could not resolve named range: " + namedRange.getNameName(), e);
         }
+        return values;
     }
 
-    public String extractPlatformKey(XSSFWorkbook workbook) {
-        try {
-            XSSFSheet metaSheet = workbook.getSheet(HIDDEN_SHEET_METADATA);
-            if (metaSheet == null) throw new SecurityException("Missing Metadata Sheet");
-            String encodedKey = metaSheet.getRow(0).getCell(0).getStringCellValue();
-            return new String(Base64.getDecoder().decode(encodedKey), StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            throw new SecurityException("Could not read platform key: " + e.getMessage());
+    private String getCellValueAsString(Cell cell) {
+        if (cell == null) return "";
+        switch (cell.getCellType()) {
+            case STRING: return cell.getStringCellValue();
+            case NUMERIC: return String.valueOf(cell.getNumericCellValue());
+            case BOOLEAN: return String.valueOf(cell.getBooleanCellValue());
+            default: return "";
         }
-    }
-
-    private String calculateHMAC(String data, String key) throws NoSuchAlgorithmException, InvalidKeyException {
-        SecretKeySpec secretKeySpec = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), hmacAlgo);
-        Mac mac = Mac.getInstance(hmacAlgo);
-        mac.init(secretKeySpec);
-        return Base64.getEncoder().encodeToString(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private CellStyle createHeaderStyle(Workbook workbook) {
-        CellStyle style = workbook.createCellStyle();
-        Font font = workbook.createFont();
-        font.setBold(true);
-        style.setFont(font);
-        style.setAlignment(HorizontalAlignment.CENTER);
-        style.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
-        style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-        return style;
     }
 }
