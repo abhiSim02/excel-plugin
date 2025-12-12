@@ -51,7 +51,6 @@ public class ExcelService {
     }
 
     public GenerationResult generateLargeExcel(ExcelRequest request, String timestamp) throws IOException {
-        // SXSSF Window: Keeps 100 rows in RAM, flushes rest to disk.
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
             workbook.setCompressTempFiles(true);
 
@@ -66,6 +65,20 @@ public class ExcelService {
             Map<String, CellStyle> styles = createStyles(workbook);
             createHeaderRow(mainSheet, request.getColumns(), styles.get("header"));
             createHeaderRow(shadowSheet, request.getColumns(), styles.get("header"));
+
+            // --- FIX START: Apply Column-Level Styling ---
+            // This ensures empty rows below the data inherit the correct Lock/Unlock status
+            for (int i = 0; i < request.getColumns().size(); i++) {
+                ExcelRequest.ColumnConfig col = request.getColumns().get(i);
+                if (col.isEditable()) {
+                    // If editable, the WHOLE column is unlocked by default (even empty rows)
+                    mainSheet.setDefaultColumnStyle(i, styles.get("editable"));
+                } else {
+                    // Otherwise, the whole column is locked
+                    mainSheet.setDefaultColumnStyle(i, styles.get("locked"));
+                }
+            }
+            // --- FIX END ---
 
             // 3. Configure Logic
             configureSheetLogic(mainSheet, workbook, request.getColumns(), lookupSheet);
@@ -86,6 +99,9 @@ public class ExcelService {
                         // A. Write to Visible Main Sheet
                         Cell mainCell = mainRow.createCell(colIdx);
                         setCellValue(mainCell, value);
+                        // Note: setCellStyle is strictly not required here anymore because
+                        // we set the default column style above, but it's good practice to keep it
+                        // to ensure specific formatting (dates/numbers) isn't lost.
                         mainCell.setCellStyle(col.isEditable() ? styles.get("editable") : styles.get("locked"));
 
                         // B. Write to Hidden Shadow Sheet
@@ -109,6 +125,8 @@ public class ExcelService {
             // 6. Hide Sheets & Protect
             workbook.setSheetVisibility(workbook.getSheetIndex(lookupSheet), SheetVisibility.VERY_HIDDEN);
             workbook.setSheetVisibility(workbook.getSheetIndex(shadowSheet), SheetVisibility.VERY_HIDDEN);
+
+            // Protect the sheet - now editable columns will remain editable in new rows
             mainSheet.protectSheet(sheetPassword);
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -230,13 +248,13 @@ public class ExcelService {
         styles.put("header", header);
 
         CellStyle editable = wb.createCellStyle();
-        editable.setLocked(false);
+        editable.setLocked(false); // <--- CRITICAL: Must be false
         editable.setFillForegroundColor(IndexedColors.LEMON_CHIFFON.getIndex());
         editable.setFillPattern(FillPatternType.SOLID_FOREGROUND);
         styles.put("editable", editable);
 
         CellStyle locked = wb.createCellStyle();
-        locked.setLocked(true);
+        locked.setLocked(true); // Default is true, but explicit is safer
         styles.put("locked", locked);
 
         return styles;
