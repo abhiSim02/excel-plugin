@@ -1,6 +1,8 @@
 package com.poc.excelplugin.service;
 
+import com.poc.excelplugin.dto.AnalysisResult;
 import com.poc.excelplugin.dto.ExcelRequest;
+import com.poc.excelplugin.dto.RowData;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
@@ -264,106 +266,83 @@ public class ExcelService {
         return name == null ? "Data" : name.replaceAll("[^a-zA-Z0-9 ]", "_");
     }
 
-    public Map<String, Object> analyzeChanges(MultipartFile file) throws IOException {
+    public AnalysisResult performDeepAnalysis(MultipartFile file) throws IOException {
+        AnalysisResult result = new AnalysisResult();
+        result.setInvalidRows(new ArrayList<>());
+        result.setModifiedRows(new ArrayList<>());
+
         try (XSSFWorkbook workbook = new XSSFWorkbook(file.getInputStream())) {
+
+            // 1. Security Check (Ensure you have the verifyFileIntegrity method, see below)
+            verifyFileIntegrity(workbook);
 
             Sheet mainSheet = workbook.getSheetAt(0);
             Sheet shadowSheet = workbook.getSheet("shadow_data");
+            if (shadowSheet == null) throw new SecurityException("Missing shadow_data");
 
-            if (shadowSheet == null) {
-                throw new IllegalArgumentException("Invalid File: Missing shadow_data for audit.");
+            // 2. Extract Headers
+            List<String> headers = new ArrayList<>();
+            Row headerRow = mainSheet.getRow(0);
+            for (Cell cell : headerRow) {
+                headers.add(cell.getStringCellValue());
             }
+            result.setHeaders(headers);
 
-            // 1. Pre-load Validation Rules
+            // 3. Load Validation Rules
             Map<Integer, Set<String>> validationRules = extractValidationRules(workbook, mainSheet);
 
-            int totalChangedCells = 0;
-            int totalInvalidCells = 0;
-
-            // Track unique row indices for different stats
-            Set<Integer> rowsWithChanges = new HashSet<>();
-            Set<Integer> rowsWithErrors = new HashSet<>();
-
-            List<Map<String, Object>> rowDetails = new ArrayList<>();
-
-            // 2. Iterate Rows
+            // 4. Scan Rows
             for (int i = 1; i <= mainSheet.getLastRowNum(); i++) {
                 Row mainRow = mainSheet.getRow(i);
                 Row shadowRow = shadowSheet.getRow(i);
 
-                if (mainRow == null) continue;
+                // Skip if both are empty
+                if (mainRow == null && shadowRow == null) continue;
 
+                Map<Integer, Object> currentRowData = new HashMap<>();
                 boolean rowChanged = false;
-                boolean rowInvalid = false;
+                StringBuilder errorMsg = new StringBuilder();
 
-                Map<String, Object> details = new LinkedHashMap<>();
-                details.put("rowIndex", i + 1);
+                // Determine max cells to check
+                int maxCells = mainRow != null ? mainRow.getLastCellNum() : (shadowRow != null ? shadowRow.getLastCellNum() : 0);
 
-                // 3. Iterate Columns
-                for (int j = 0; j < mainRow.getLastCellNum(); j++) {
-                    String original = getCellValueAsString(shadowRow.getCell(j));
-                    String current = getCellValueAsString(mainRow.getCell(j));
+                for (int j = 0; j < maxCells; j++) {
+                    Cell mainCell = mainRow != null ? mainRow.getCell(j) : null;
+                    Cell shadowCell = shadowRow != null ? shadowRow.getCell(j) : null;
 
-                    // A. CHANGE DETECTION
-                    if (!Objects.equals(original, current)) {
-                        details.put("col_" + j + "_change", "Changed from [" + original + "] to [" + current + "]");
-                        totalChangedCells++;
-                        rowChanged = true;
+                    // Capture value for the new file (using helper)
+                    Object val = getCellValueForDto(mainCell);
+                    currentRowData.put(j, val);
+
+                    // A. Check Validation (RED Logic)
+                    String strVal = getCellValueAsString(mainCell);
+                    if (validationRules.containsKey(j) && !strVal.isEmpty()) {
+                        if (!validationRules.get(j).contains(strVal)) {
+                            errorMsg.append("[").append(headers.get(j)).append(": Invalid Value '").append(strVal).append("'] ");
+                        }
                     }
 
-                    // B. VALIDATION CHECK
-                    if (validationRules.containsKey(j)) {
-                        Set<String> allowedValues = validationRules.get(j);
-                        if (!current.isEmpty() && !allowedValues.contains(current)) {
-                            details.put("col_" + j + "_error", "Invalid Value: [" + current + "]");
-                            totalInvalidCells++;
-                            rowInvalid = true;
+                    // B. Check Modification (ORANGE Logic) - Only if no error yet
+                    if (errorMsg.length() == 0) {
+                        if (hasCellValueChanged(shadowCell, mainCell)) {
+                            rowChanged = true;
                         }
                     }
                 }
 
-                if (rowChanged) rowsWithChanges.add(i);
-                if (rowInvalid) rowsWithErrors.add(i);
-
-                // Report if EITHER changed OR invalid
-                if (rowChanged || rowInvalid) {
-                    // Add status flag for UI convenience
-                    details.put("status", rowInvalid ? "INVALID" : "MODIFIED_VALID");
-                    rowDetails.add(details);
+                // Decision Time
+                if (errorMsg.length() > 0) {
+                    // RED CASE
+                    result.getInvalidRows().add(new RowData(i, currentRowData, errorMsg.toString()));
+                } else if (rowChanged) {
+                    // ORANGE CASE
+                    result.getModifiedRows().add(new RowData(i, currentRowData, null));
                 }
             }
-
-            // 4. Construct Precise Stats
-            int totalRows = mainSheet.getLastRowNum();
-
-            Map<String, Object> stats = new LinkedHashMap<>();
-            stats.put("totalRowsProcessed", totalRows);
-
-            // Purely valid data (Total - Invalid)
-            stats.put("totalValidRows", totalRows - rowsWithErrors.size());
-
-            // The number you are looking for (3)
-            stats.put("totalRowsWithErrors", rowsWithErrors.size());
-
-            // The number of touched rows (6)
-            stats.put("totalRowsModified", rowsWithChanges.size());
-
-            stats.put("totalChangedCells", totalChangedCells);
-            stats.put("totalInvalidCells", totalInvalidCells);
-
-            if (totalRows > 0) {
-                stats.put("errorRate", String.format("%.2f%%", (double) rowsWithErrors.size() / totalRows * 100));
-            } else {
-                stats.put("errorRate", "0.00%");
-            }
-
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("statistics", stats);
-            result.put("details", rowDetails);
-
-            return result;
         }
+        return result;
     }
+
     /**
      * Extracts dropdown options from the file by resolving Named Ranges.
      */
@@ -425,6 +404,54 @@ public class ExcelService {
         }
         return values;
     }
+    // =========================================================================
+    // NEW: Generate a "Subset" Excel (For Error Dump or Delta Load)
+    // =========================================================================
+    public byte[] generateSubsetExcel(List<String> headers, List<RowData> rows, boolean includeErrorCol) throws IOException {
+        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
+            Sheet sheet = workbook.createSheet("Data");
+
+            // 1. Create Header
+            Row headerRow = sheet.createRow(0);
+            for (int i = 0; i < headers.size(); i++) {
+                headerRow.createCell(i).setCellValue(headers.get(i));
+            }
+            if (includeErrorCol) {
+                // Add an extra column for the Error Message in the dump
+                headerRow.createCell(headers.size()).setCellValue("ERROR_DETAILS");
+            }
+
+            // 2. Write Rows
+            int rowIdx = 1;
+            for (RowData data : rows) {
+                Row row = sheet.createRow(rowIdx++);
+
+                // Write original columns
+                data.getCellValues().forEach((colIndex, value) -> {
+                    Cell cell = row.createCell(colIndex);
+                    setCellValue(cell, value); // Use your existing helper
+                });
+
+                // Write Error Message if needed
+                if (includeErrorCol && data.getErrorMessage() != null) {
+                    Cell errCell = row.createCell(headers.size());
+                    errCell.setCellValue(data.getErrorMessage());
+
+                    // Optional: Make it Red
+                    CellStyle errStyle = workbook.createCellStyle();
+                    Font font = workbook.createFont();
+                    font.setColor(IndexedColors.RED.getIndex());
+                    errStyle.setFont(font);
+                    errCell.setCellStyle(errStyle);
+                }
+            }
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            workbook.write(out);
+            return out.toByteArray();
+        }
+    }
+
 
     private String getCellValueAsString(Cell cell) {
         if (cell == null) return "";
@@ -433,6 +460,91 @@ public class ExcelService {
             case NUMERIC: return String.valueOf(cell.getNumericCellValue());
             case BOOLEAN: return String.valueOf(cell.getBooleanCellValue());
             default: return "";
+        }
+    }
+    private void verifyFileIntegrity(Workbook workbook) {
+        Sheet metaSheet = workbook.getSheet(HIDDEN_SHEET_METADATA);
+        if (metaSheet == null) {
+            throw new SecurityException("Metadata sheet missing. File is not from this system.");
+        }
+
+        try {
+            // 1. Read stored signature
+            String b64Encoded = metaSheet.getRow(0).getCell(0).getStringCellValue();
+            String decoded = new String(Base64.getDecoder().decode(b64Encoded), StandardCharsets.UTF_8);
+
+            // Format: signature::dataHash::entity::user::timestamp
+            String[] parts = decoded.split("::");
+            if (parts.length != 5) throw new SecurityException("Metadata format invalid.");
+
+            String storedSig = parts[0];
+            String dataHash = parts[1];
+            String entity = parts[2];
+            String user = parts[3];
+            String timestamp = parts[4];
+
+            // 2. Re-compute Signature using Server Secret
+            String payload = entity + "|" + user + "|" + timestamp + "|" + dataHash;
+
+            Mac mac = Mac.getInstance("HmacSHA256");
+            SecretKeySpec secretKeySpec = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+            mac.init(secretKeySpec);
+            String fullSig = Base64.getEncoder().encodeToString(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
+            String computedSig = fullSig.length() > 24 ? fullSig.substring(0, 24) : fullSig;
+
+            // 3. Validate
+            if (!storedSig.equals(computedSig)) {
+                throw new SecurityException("Signature Mismatch. File metadata has been tampered with.");
+            }
+        } catch (Exception e) {
+            throw new SecurityException("Integrity Check Failed: " + e.getMessage());
+        }
+    }
+    private boolean hasCellValueChanged(Cell shadow, Cell main) {
+        if (shadow == null && main == null) return false;
+        if (shadow == null || main == null) return true; // One empty, one not
+
+        // Normalize Types
+        CellType typeS = shadow.getCellType();
+        CellType typeM = main.getCellType();
+
+        // If types differ (e.g. String vs Number), it's a change
+        // Exception: Formula vs Calculated Value
+        if (typeS != typeM && typeM != CellType.FORMULA && typeS != CellType.FORMULA) {
+            String strS = getCellValueAsString(shadow).trim();
+            String strM = getCellValueAsString(main).trim();
+            return !strS.equals(strM);
+        }
+
+        switch (main.getCellType()) {
+            case STRING:
+                return !shadow.getStringCellValue().trim().equals(main.getStringCellValue().trim());
+            case NUMERIC:
+                if (DateUtil.isCellDateFormatted(main)) {
+                    try {
+                        return !shadow.getLocalDateTimeCellValue().isEqual(main.getLocalDateTimeCellValue());
+                    } catch (Exception e) { return true; }
+                } else {
+                    // Compare with epsilon for float precision
+                    return Math.abs(shadow.getNumericCellValue() - main.getNumericCellValue()) > 0.000001;
+                }
+            case BOOLEAN:
+                return shadow.getBooleanCellValue() != main.getBooleanCellValue();
+            case BLANK:
+                return shadow.getCellType() != CellType.BLANK;
+            default:
+                return !getCellValueAsString(shadow).equals(getCellValueAsString(main));
+        }
+    }
+    private Object getCellValueForDto(Cell cell) {
+        if (cell == null) return null;
+        switch (cell.getCellType()) {
+            case STRING: return cell.getStringCellValue();
+            case NUMERIC:
+                if (DateUtil.isCellDateFormatted(cell)) return cell.getLocalDateTimeCellValue();
+                return cell.getNumericCellValue();
+            case BOOLEAN: return cell.getBooleanCellValue();
+            default: return cell.toString();
         }
     }
 }

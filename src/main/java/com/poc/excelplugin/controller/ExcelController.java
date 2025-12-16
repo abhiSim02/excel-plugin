@@ -6,8 +6,9 @@ import com.poc.excelplugin.entity.UserFileHash;
 import com.poc.excelplugin.repository.UserHashRepository;
 import com.poc.excelplugin.service.ExcelService;
 import com.poc.excelplugin.service.FileStorageService;
+import com.poc.excelplugin.service.UploadService;
+import lombok.RequiredArgsConstructor; // <--- IMP: Import this
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -21,11 +22,14 @@ import java.util.Optional;
 @Slf4j
 @RestController
 @RequestMapping("/api/excel")
+@RequiredArgsConstructor
 public class ExcelController {
 
-    @Autowired private ExcelService excelService;
-    @Autowired private UserHashRepository userHashRepository;
-    @Autowired private FileStorageService fileStorageService;
+    // Make all services FINAL so Lombok injects them automatically
+    private final ExcelService excelService;
+    private final UserHashRepository userHashRepository;
+    private final FileStorageService fileStorageService;
+    private final UploadService uploadService;
 
     @PostMapping("/generate")
     public ResponseEntity<ApiResponse<String>> generateExcel(@RequestBody ExcelRequest request) {
@@ -58,19 +62,25 @@ public class ExcelController {
 
     @PostMapping("/verify")
     public ResponseEntity<ApiResponse<String>> verifyExcel(@RequestParam("file") MultipartFile file) {
-        // NOTE: For full security, you must read the file here, re-calculate the DataHash
-        // of Read-Only columns, and compare it with the signature.
-        // For brevity in this file list, we are keeping the DB check only.
-        // Implement the "Read and Hash" logic using SAX Event API (Reader) for large files.
         return ResponseEntity.ok(ApiResponse.success("Verification logic placeholder", "Use SAX Reader for 1M rows"));
     }
-    @PostMapping("/analyze")
+
+    @PostMapping("/upload")
     public ResponseEntity<ApiResponse<Map<String, Object>>> analyzeUpload(@RequestParam("file") MultipartFile file) {
         try {
-            Map<String, Object> report = excelService.analyzeChanges(file);
-            return ResponseEntity.ok(ApiResponse.success("Audit Complete", report));
+            // The Service decides if it's a "Success" (Delta generated) or "Failure" (Error dump generated)
+            Map<String, Object> result = uploadService.processUpload(file);
+
+            if ("FAILED".equals(result.get("status"))) {
+                // Return 400 Bad Request if validation failed, but include the path to the Error Report
+                // This allows the frontend to show "Validation Failed" and provide a "Download Error Report" button
+                return ResponseEntity.badRequest().body(ApiResponse.error("Validation Failed. Error report generated.", result.get("reportPath").toString()));
+            }
+
+            return ResponseEntity.ok(ApiResponse.success("File Processed Successfully", result));
         } catch (Exception e) {
-            return ResponseEntity.status(500).body(ApiResponse.error(e.getMessage(), "AUDIT_FAIL"));
+            log.error("Upload failed", e);
+            return ResponseEntity.internalServerError().body(ApiResponse.error(e.getMessage(), "UPLOAD_FAIL"));
         }
     }
 }
