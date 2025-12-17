@@ -22,8 +22,10 @@ import org.springframework.web.multipart.MultipartFile;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
@@ -266,14 +268,16 @@ public class ExcelService {
         return name == null ? "Data" : name.replaceAll("[^a-zA-Z0-9 ]", "_");
     }
 
-    public AnalysisResult performDeepAnalysis(MultipartFile file) throws IOException {
+    public AnalysisResult performDeepAnalysis(InputStream fileStream) throws IOException {
         AnalysisResult result = new AnalysisResult();
         result.setInvalidRows(new ArrayList<>());
         result.setModifiedRows(new ArrayList<>());
 
-        try (XSSFWorkbook workbook = new XSSFWorkbook(file.getInputStream())) {
+        // WRAP IN BufferedInputStream: Essential for Zip/POI detection on raw streams
+        try (BufferedInputStream bis = new BufferedInputStream(fileStream);
+             XSSFWorkbook workbook = new XSSFWorkbook(bis)) {
 
-            // 1. Security Check (Ensure you have the verifyFileIntegrity method, see below)
+            // 1. Security Check
             verifyFileIntegrity(workbook);
 
             Sheet mainSheet = workbook.getSheetAt(0);
@@ -296,25 +300,21 @@ public class ExcelService {
                 Row mainRow = mainSheet.getRow(i);
                 Row shadowRow = shadowSheet.getRow(i);
 
-                // Skip if both are empty
                 if (mainRow == null && shadowRow == null) continue;
 
                 Map<Integer, Object> currentRowData = new HashMap<>();
                 boolean rowChanged = false;
                 StringBuilder errorMsg = new StringBuilder();
 
-                // Determine max cells to check
                 int maxCells = mainRow != null ? mainRow.getLastCellNum() : (shadowRow != null ? shadowRow.getLastCellNum() : 0);
 
                 for (int j = 0; j < maxCells; j++) {
                     Cell mainCell = mainRow != null ? mainRow.getCell(j) : null;
                     Cell shadowCell = shadowRow != null ? shadowRow.getCell(j) : null;
 
-                    // Capture value for the new file (using helper)
                     Object val = getCellValueForDto(mainCell);
                     currentRowData.put(j, val);
 
-                    // A. Check Validation (RED Logic)
                     String strVal = getCellValueAsString(mainCell);
                     if (validationRules.containsKey(j) && !strVal.isEmpty()) {
                         if (!validationRules.get(j).contains(strVal)) {
@@ -322,7 +322,6 @@ public class ExcelService {
                         }
                     }
 
-                    // B. Check Modification (ORANGE Logic) - Only if no error yet
                     if (errorMsg.length() == 0) {
                         if (hasCellValueChanged(shadowCell, mainCell)) {
                             rowChanged = true;
@@ -330,12 +329,9 @@ public class ExcelService {
                     }
                 }
 
-                // Decision Time
                 if (errorMsg.length() > 0) {
-                    // RED CASE
                     result.getInvalidRows().add(new RowData(i, currentRowData, errorMsg.toString()));
                 } else if (rowChanged) {
-                    // ORANGE CASE
                     result.getModifiedRows().add(new RowData(i, currentRowData, null));
                 }
             }
